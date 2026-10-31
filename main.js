@@ -1,7 +1,11 @@
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
 import fs from 'fs';
+import path from 'node:path';
+import readline from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
 import { pathToFileURL } from 'node:url';
+import sharp from 'sharp';
 import key from './key.json' with { type: 'json' };
 
 const serviceAccountAuth = new JWT({
@@ -12,9 +16,15 @@ const serviceAccountAuth = new JWT({
 
 const doc = new GoogleSpreadsheet('1bjS9PdxydPsdJ98MPOWG5wHY40wvIplP6ORw6NfAHX4', serviceAccountAuth);
 
-const CANVAS_WIDTH = 6850; // 58cm a 300 DPI
-const MARGIN_PX = 71;      // 6mm de espaçamento entre estampas, a 300 DPI
-const PAGE_HEIGHT_PX = 11811; // 1 metro a 300 DPI
+const DPI = 300;
+const MARGIN_PX = 71; // 6mm de espaçamento entre estampas, a 300 DPI
+const PAGE_HEIGHT_CM = 100;
+const EXTRA_DIR = './extra-stamps';
+const WIDTHS_CM = ['58', '60', '57'];
+
+function cmToPx(cm) {
+  return Math.round(cm / 2.54 * DPI);
+}
 
 function formatFileName(text) {
   return text.toLowerCase()
@@ -24,18 +34,153 @@ function formatFileName(text) {
 }
 
 function readPngSize(filePath) {
-  const buf = Buffer.alloc(24);
-  const fd = fs.openSync(filePath, 'r');
-  try {
-    fs.readSync(fd, buf, 0, 24, 0);
-  } finally {
-    fs.closeSync(fd);
-  }
-  const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+  const buf = fs.readFileSync(filePath);
+  const isPng = buf.length >= 24 && buf[0] === 0x89 && buf.toString('ascii', 1, 4) === 'PNG';
   if (!isPng) {
     throw new Error(`Arquivo sem tamanho PNG legível: ${filePath}`);
   }
-  return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+
+  const w = buf.readUInt32BE(16);
+  const h = buf.readUInt32BE(20);
+  let dpi = DPI;
+  let offset = 8;
+  while (offset + 8 <= buf.length) {
+    const length = buf.readUInt32BE(offset);
+    const type = buf.toString('ascii', offset + 4, offset + 8);
+    if (type === 'pHYs' && length >= 9 && buf[offset + 16] === 1) {
+      const ppm = buf.readUInt32BE(offset + 8);
+      if (ppm > 0) dpi = ppm * 0.0254;
+    }
+    if (type === 'IEND') break;
+    offset += 12 + length;
+  }
+
+  const scale = DPI / dpi;
+  return { w: Math.max(1, Math.round(w * scale)), h: Math.max(1, Math.round(h * scale)) };
+}
+
+function svgAttr(tag, name) {
+  const match = tag.match(new RegExp(`\\b${name}\\s*=\\s*(['"])(.*?)\\1`, 'i'));
+  return match ? match[2] : null;
+}
+
+// mm/cm/in são tamanho físico. px (ou sem unidade) é o pixel CSS do Inkscape, 96 por polegada.
+function lengthToPx(value) {
+  const match = String(value).trim().match(/^([0-9]*\.?[0-9]+)\s*(mm|cm|in|px|pt)?$/i);
+  if (!match) return null;
+  const n = parseFloat(match[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  switch ((match[2] || 'px').toLowerCase()) {
+    case 'mm': return n / 25.4 * DPI;
+    case 'cm': return n / 2.54 * DPI;
+    case 'in': return n * DPI;
+    case 'pt': return n / 72 * DPI;
+    case 'px': return n / 96 * DPI;
+    default: return null;
+  }
+}
+
+function readSvgSize(filePath) {
+  const text = fs.readFileSync(filePath, 'utf8');
+  const tag = text.match(/<svg\b[^>]*>/i)?.[0];
+  if (!tag) throw new Error('SVG sem elemento raiz');
+
+  let w = lengthToPx(svgAttr(tag, 'width') || '');
+  let h = lengthToPx(svgAttr(tag, 'height') || '');
+  const viewBox = svgAttr(tag, 'viewBox');
+  if ((!w || !h) && viewBox) {
+    const parts = viewBox.trim().split(/[\s,]+/).map(Number);
+    if (parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
+      if (!w) w = lengthToPx(`${parts[2]}px`);
+      if (!h) h = lengthToPx(`${parts[3]}px`);
+    }
+  }
+  if (!w || !h) throw new Error('SVG sem largura e altura');
+  return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
+}
+
+function readArtworkSize(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.png') return readPngSize(filePath);
+  if (ext === '.svg') return readSvgSize(filePath);
+  throw new Error('use PNG ou SVG');
+}
+
+function pxToCm(px) {
+  return (px / DPI * 2.54).toFixed(1);
+}
+
+function loadExtraStamps() {
+  fs.mkdirSync(EXTRA_DIR, { recursive: true });
+  const blocks = [];
+  for (const name of fs.readdirSync(EXTRA_DIR)) {
+    if (name.startsWith('.')) continue;
+    const imagePath = path.join(EXTRA_DIR, name);
+    if (!fs.statSync(imagePath).isFile()) continue;
+    const ext = path.extname(name).toLowerCase();
+    if (ext !== '.png' && ext !== '.svg') {
+      console.warn(`Aviso: ${name} ignorado. A pasta extra-stamps aceita PNG ou SVG.`);
+      continue;
+    }
+    try {
+      const { w, h } = readArtworkSize(imagePath);
+      console.log(`Estampa extra: ${name} — ${pxToCm(w)} x ${pxToCm(h)} cm`);
+      blocks.push({ file: name, imagePath, ow: w, oh: h });
+    } catch (err) {
+      console.warn(`Aviso: não foi possível medir ${name}. ${err.message}`);
+    }
+  }
+  return blocks;
+}
+
+function createPrompter() {
+  const rl = readline.createInterface({ input, output, terminal: Boolean(input.isTTY) });
+  const pending = [];
+  let waiter = null;
+  const deliver = (line) => {
+    if (waiter) {
+      const resolve = waiter;
+      waiter = null;
+      resolve(line);
+    } else {
+      pending.push(line);
+    }
+  };
+  rl.on('line', deliver);
+  rl.on('close', () => deliver(''));
+  return {
+    question(prompt) {
+      output.write(prompt);
+      if (pending.length) return Promise.resolve(pending.shift());
+      return new Promise((resolve) => { waiter = resolve; });
+    },
+    close() {
+      rl.removeAllListeners('line');
+      rl.removeAllListeners('close');
+      rl.close();
+    },
+  };
+}
+
+async function ask(prompter, question, allowed, fallback) {
+  while (true) {
+    const raw = (await prompter.question(question)).trim().toLowerCase();
+    const answer = raw.replace(/\s*cm$/, '');
+    if (!answer) return fallback;
+    if (allowed.includes(answer)) return answer;
+    console.log(`Digite ${allowed.join(' ou ')}. Enter mantém ${fallback}.`);
+  }
+}
+
+async function askSheetOptions() {
+  const prompter = createPrompter();
+  try {
+    const formato = await ask(prompter, 'Formato da prancha (svg/png) [svg]: ', ['svg', 'png'], 'svg');
+    const largura = await ask(prompter, 'Largura em cm (58, 60 ou 57) [58]: ', WIDTHS_CM, '58');
+    return { formato, larguraCm: Number(largura) };
+  } finally {
+    prompter.close();
+  }
 }
 
 // A margem entra no retângulo ocupado, mas a folha de encaixe é 6mm mais larga
@@ -124,7 +269,36 @@ class Packer {
   }
 }
 
+async function writePng(blocks, canvasWidth, canvasHeight, filePath) {
+  const composites = [];
+  for (const b of blocks) {
+    if (!b.fit) continue;
+    const placedW = b.rotated ? b.oh : b.ow;
+    const placedH = b.rotated ? b.ow : b.oh;
+    let pipeline = sharp(b.imagePath, { density: DPI, limitInputPixels: false });
+    if (b.rotated) {
+      pipeline = pipeline.rotate(90, { background: { r: 0, g: 0, b: 0, alpha: 0 } });
+    }
+    const png = await pipeline.resize(placedW, placedH, { fit: 'fill' }).png().toBuffer();
+    composites.push({ input: png, left: b.fit.x, top: b.fit.y });
+  }
+
+  await sharp({
+    create: {
+      width: canvasWidth,
+      height: canvasHeight,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+    limitInputPixels: false,
+  }).composite(composites).withMetadata({ density: DPI }).png().toFile(filePath);
+}
+
 async function generateDTFSheet() {
+  const { formato, larguraCm } = await askSheetOptions();
+  const canvasWidth = cmToPx(larguraCm);
+  const pageHeightPx = cmToPx(PAGE_HEIGHT_CM);
+
   await doc.loadInfo();
   const sheet = doc.sheetsByTitle['Pedidos']; 
   const rows = await sheet.getRows();
@@ -157,7 +331,6 @@ async function generateDTFSheet() {
 
   if (itemsToPrint.length === 0) {
     console.log('Nenhum pedido com status "Recebido" encontrado.');
-    return;
   }
 
   const blocks = [];
@@ -171,15 +344,17 @@ async function generateDTFSheet() {
     blocks.push({ file: item.file, imagePath, ow: w, oh: h });
   }
 
+  blocks.push(...loadExtraStamps());
+
   if (blocks.length === 0) {
-    console.log('Nenhum arquivo de estampa encontrado na pasta /labels.');
+    console.log('Nada para imprimir.');
     return;
   }
 
-  // Maiores primeiro; as golas entram depois e ocupam a sobra da lateral.
+  // Maiores primeiro; as golas e as sobras entram depois e ocupam a lateral.
   blocks.sort((a, b) => (b.ow * b.oh) - (a.ow * a.oh));
 
-  const packer = new Packer(CANVAS_WIDTH, MARGIN_PX);
+  const packer = new Packer(canvasWidth, MARGIN_PX);
   packer.fit(blocks);
 
   let actualHeight = 0;
@@ -193,50 +368,54 @@ async function generateDTFSheet() {
     if (bottom > actualHeight) actualHeight = bottom;
   }
 
-  const metrosNecessarios = Math.max(1, Math.ceil(actualHeight / PAGE_HEIGHT_PX));
-  const CANVAS_HEIGHT = metrosNecessarios * PAGE_HEIGHT_PX;
+  const metrosNecessarios = Math.max(1, Math.ceil(actualHeight / pageHeightPx));
+  const canvasHeight = metrosNecessarios * pageHeightPx;
 
   if (metrosNecessarios > 1) {
     console.log(`Aviso: A quantidade exige uma prancha de ${metrosNecessarios} metros (${metrosNecessarios * 100}cm).`);
   }
 
-  const pxToMm = (px) => (px / 300) * 25.4;
+  const pxToMm = (px) => (px / DPI) * 25.4;
+  const fitted = blocks.filter(b => b.fit);
+  const arquivo = formato === 'png' ? 'bloco_dtf_completo.png' : 'bloco_dtf_completo.svg';
 
-  const widthMm = pxToMm(CANVAS_WIDTH);
-  const heightMm = pxToMm(CANVAS_HEIGHT);
+  if (formato === 'png') {
+    await writePng(fitted, canvasWidth, canvasHeight, arquivo);
+  } else {
+    const widthMm = pxToMm(canvasWidth);
+    const heightMm = pxToMm(canvasHeight);
+    let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${widthMm.toFixed(3)}mm" height="${heightMm.toFixed(3)}mm" viewBox="0 0 ${widthMm.toFixed(3)} ${heightMm.toFixed(3)}">\n`;
 
-  let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${widthMm.toFixed(3)}mm" height="${heightMm.toFixed(3)}mm" viewBox="0 0 ${widthMm.toFixed(3)} ${heightMm.toFixed(3)}">\n`;
+    for (const b of fitted) {
+      const base64Data = fs.readFileSync(b.imagePath, 'base64');
+      const mimeType = path.extname(b.file).toLowerCase() === '.svg' ? 'image/svg+xml' : 'image/png';
+      const xMm = pxToMm(b.fit.x);
+      const yMm = pxToMm(b.fit.y);
+      const owMm = pxToMm(b.ow);
+      const ohMm = pxToMm(b.oh);
 
-  let estampasProcessadas = 0;
-
-  for (const b of blocks) {
-    if (!b.fit) continue;
-
-    const base64Data = fs.readFileSync(b.imagePath, 'base64');
-    const mimeType = b.file.endsWith('.svg') ? 'image/svg+xml' : 'image/png';
-    
-    const xMm = pxToMm(b.fit.x);
-    const yMm = pxToMm(b.fit.y);
-    const owMm = pxToMm(b.ow);
-    const ohMm = pxToMm(b.oh);
-
-    if (b.rotated) {
-      const transX = (xMm + ohMm).toFixed(3);
-      const transY = yMm.toFixed(3);
-      svgContent += `  <image href="data:${mimeType};base64,${base64Data}" width="${owMm.toFixed(3)}" height="${ohMm.toFixed(3)}" transform="translate(${transX}, ${transY}) rotate(90)" />\n`;
-    } else {
-      svgContent += `  <image href="data:${mimeType};base64,${base64Data}" x="${xMm.toFixed(3)}" y="${yMm.toFixed(3)}" width="${owMm.toFixed(3)}" height="${ohMm.toFixed(3)}" />\n`;
+      if (b.rotated) {
+        const transX = (xMm + ohMm).toFixed(3);
+        const transY = yMm.toFixed(3);
+        svgContent += `  <image href="data:${mimeType};base64,${base64Data}" width="${owMm.toFixed(3)}" height="${ohMm.toFixed(3)}" transform="translate(${transX}, ${transY}) rotate(90)" />\n`;
+      } else {
+        svgContent += `  <image href="data:${mimeType};base64,${base64Data}" x="${xMm.toFixed(3)}" y="${yMm.toFixed(3)}" width="${owMm.toFixed(3)}" height="${ohMm.toFixed(3)}" />\n`;
+      }
     }
-    estampasProcessadas++;
+
+    svgContent += `</svg>`;
+    fs.writeFileSync(arquivo, svgContent);
   }
 
-  svgContent += `</svg>`;
+  const estampasProcessadas = fitted.length;
 
-  fs.writeFileSync('bloco_dtf_completo.svg', svgContent);
-  const usadoCm = ((actualHeight / 300) * 2.54).toFixed(1);
-  console.log(`Pronto! ${estampasProcessadas} estampas em ${usadoCm}cm de altura, numa prancha de 58x${metrosNecessarios * 100}cm.`);
+  const usadoCm = pxToCm(actualHeight);
+  console.log(`Pronto! ${estampasProcessadas} estampas em ${usadoCm}cm de altura, numa prancha de ${larguraCm}x${metrosNecessarios * PAGE_HEIGHT_CM}cm (${arquivo}).`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  generateDTFSheet();
+  generateDTFSheet().catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  });
 }
