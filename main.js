@@ -21,6 +21,51 @@ const MARGIN_PX = 71; // 6mm de espaçamento entre estampas, a 300 DPI
 const PAGE_HEIGHT_CM = 100;
 const EXTRA_DIR = './extra-stamps';
 const WIDTHS_CM = ['58', '60', '57'];
+const METER_PRICE = 38;
+const METER_WIDTH_CM = 58;
+
+const ansi = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  cyan: '\x1b[36m',
+  magenta: '\x1b[35m',
+};
+
+function paint(stream, codes, text) {
+  if (!stream.isTTY || process.env.NO_COLOR != null) return text;
+  return `${codes}${text}${ansi.reset}`;
+}
+
+function tag(stream, label, color) {
+  return paint(stream, ansi.bold + color, label.padEnd(6));
+}
+
+function warn(message) {
+  console.warn(`${tag(process.stderr, 'aviso', ansi.yellow)} ${message}`);
+}
+
+function note(message) {
+  console.log(`${tag(output, 'info', ansi.cyan)} ${message}`);
+}
+
+function formatCm(px) {
+  return (px / DPI * 2.54).toFixed(1).replace('.', ',');
+}
+
+function stampReais(wPx, hPx) {
+  const areaCm2 = (wPx / DPI * 2.54) * (hPx / DPI * 2.54);
+  return areaCm2 / (METER_WIDTH_CM * PAGE_HEIGHT_CM) * METER_PRICE;
+}
+
+function formatReais(value) {
+  const [inteiro, centavos] = value.toFixed(2).split('.');
+  const milhar = inteiro.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  return `R$ ${milhar},${centavos}`;
+}
 
 function cmToPx(cm) {
   return Math.round(cm / 2.54 * DPI);
@@ -106,10 +151,6 @@ function readArtworkSize(filePath) {
   throw new Error('use PNG ou SVG');
 }
 
-function pxToCm(px) {
-  return (px / DPI * 2.54).toFixed(1);
-}
-
 function loadExtraStamps() {
   fs.mkdirSync(EXTRA_DIR, { recursive: true });
   const blocks = [];
@@ -119,15 +160,16 @@ function loadExtraStamps() {
     if (!fs.statSync(imagePath).isFile()) continue;
     const ext = path.extname(name).toLowerCase();
     if (ext !== '.png' && ext !== '.svg') {
-      console.warn(`Aviso: ${name} ignorado. A pasta extra-stamps aceita PNG ou SVG.`);
+      warn(`${name} ignorado. A pasta extra-stamps aceita PNG ou SVG.`);
       continue;
     }
     try {
       const { w, h } = readArtworkSize(imagePath);
-      console.log(`Estampa extra: ${name} — ${pxToCm(w)} x ${pxToCm(h)} cm`);
+      const size = paint(output, ansi.dim, `${formatCm(w)} × ${formatCm(h)} cm`);
+      console.log(`${tag(output, 'extra', ansi.cyan)} ${name}  ${size}`);
       blocks.push({ file: name, imagePath, ow: w, oh: h });
     } catch (err) {
-      console.warn(`Aviso: não foi possível medir ${name}. ${err.message}`);
+      warn(`não foi possível medir ${name}. ${err.message}`);
     }
   }
   return blocks;
@@ -168,15 +210,17 @@ async function ask(prompter, question, allowed, fallback) {
     const answer = raw.replace(/\s*cm$/, '');
     if (!answer) return fallback;
     if (allowed.includes(answer)) return answer;
-    console.log(`Digite ${allowed.join(' ou ')}. Enter mantém ${fallback}.`);
+    console.log(`${tag(output, 'aviso', ansi.yellow)} Digite ${allowed.join(' ou ')}. Enter mantém ${fallback}.`);
   }
 }
 
 async function askSheetOptions() {
   const prompter = createPrompter();
   try {
-    const formato = await ask(prompter, 'Formato da prancha (svg/png) [svg]: ', ['svg', 'png'], 'svg');
-    const largura = await ask(prompter, 'Largura em cm (58, 60 ou 57) [58]: ', WIDTHS_CM, '58');
+    const formatoLabel = paint(output, ansi.bold + ansi.magenta, 'formato');
+    const larguraLabel = paint(output, ansi.bold + ansi.magenta, 'largura');
+    const formato = await ask(prompter, `${formatoLabel}  svg ou png [svg]: `, ['svg', 'png'], 'svg');
+    const largura = await ask(prompter, `${larguraLabel}  58, 60 ou 57 cm [58]: `, WIDTHS_CM, '58');
     return { formato, larguraCm: Number(largura) };
   } finally {
     prompter.close();
@@ -330,14 +374,14 @@ async function generateDTFSheet() {
   });
 
   if (itemsToPrint.length === 0) {
-    console.log('Nenhum pedido com status "Recebido" encontrado.');
+    note('Nenhum pedido com status "Recebido" encontrado.');
   }
 
   const blocks = [];
   for (const item of itemsToPrint) {
     const imagePath = `./labels/${item.file}`;
     if (!fs.existsSync(imagePath)) {
-      console.warn(`Aviso: Arquivo ${imagePath} faltando.`);
+      warn(`Arquivo ${imagePath} faltando.`);
       continue;
     }
     const { w, h } = readPngSize(imagePath);
@@ -347,7 +391,7 @@ async function generateDTFSheet() {
   blocks.push(...loadExtraStamps());
 
   if (blocks.length === 0) {
-    console.log('Nada para imprimir.');
+    note('Nada para imprimir.');
     return;
   }
 
@@ -360,7 +404,7 @@ async function generateDTFSheet() {
   let actualHeight = 0;
   for (const b of blocks) {
     if (!b.fit) {
-      console.warn(`Aviso: sem espaço na folha para ${b.file}.`);
+      warn(`sem espaço na folha para ${b.file}.`);
       continue;
     }
     const placedH = b.rotated ? b.ow : b.oh;
@@ -372,7 +416,7 @@ async function generateDTFSheet() {
   const canvasHeight = metrosNecessarios * pageHeightPx;
 
   if (metrosNecessarios > 1) {
-    console.log(`Aviso: A quantidade exige uma prancha de ${metrosNecessarios} metros (${metrosNecessarios * 100}cm).`);
+    warn(`A quantidade exige uma prancha de ${metrosNecessarios} metros (${metrosNecessarios * 100} cm).`);
   }
 
   const pxToMm = (px) => (px / DPI) * 25.4;
@@ -407,15 +451,50 @@ async function generateDTFSheet() {
     fs.writeFileSync(arquivo, svgContent);
   }
 
-  const estampasProcessadas = fitted.length;
+  printPrices(fitted);
 
-  const usadoCm = pxToCm(actualHeight);
-  console.log(`Pronto! ${estampasProcessadas} estampas em ${usadoCm}cm de altura, numa prancha de ${larguraCm}x${metrosNecessarios * PAGE_HEIGHT_CM}cm (${arquivo}).`);
+  const usadoCm = formatCm(actualHeight);
+  const resumo = `${fitted.length} estampas em ${usadoCm} cm de altura, numa prancha de ${larguraCm}×${metrosNecessarios * PAGE_HEIGHT_CM} cm (${arquivo}).`;
+  console.log(`${tag(output, 'pronto', ansi.green)} ${resumo}`);
+}
+
+function printPrices(fitted) {
+  if (fitted.length === 0) return;
+
+  const groups = new Map();
+  for (const block of fitted) {
+    const key = `${block.file}\0${block.ow}\0${block.oh}`;
+    const group = groups.get(key) || { file: block.file, ow: block.ow, oh: block.oh, count: 0 };
+    group.count += 1;
+    groups.set(key, group);
+  }
+
+  const rows = [...groups.values()].sort((a, b) => (b.ow * b.oh) - (a.ow * a.oh));
+  const nameWidth = Math.max(...rows.map(row => row.file.length));
+  let total = 0;
+
+  console.log('');
+  console.log(`${paint(output, ansi.bold, 'Valor aproximado')}  ${paint(output, ansi.dim, 'R$ 38,00 pelo metro de 100×58 cm')}`);
+  for (const row of rows) {
+    const each = stampReais(row.ow, row.oh);
+    const subtotal = each * row.count;
+    total += subtotal;
+    const qty = `${String(row.count).padStart(2)}×`;
+    const name = row.file.padEnd(nameWidth);
+    const size = `${formatCm(row.ow)} × ${formatCm(row.oh)} cm`.padEnd(16);
+    const money = row.count > 1
+      ? `${formatReais(subtotal).padStart(10)}   ${formatReais(each)} cada`
+      : formatReais(subtotal).padStart(10);
+    console.log(`  ${paint(output, ansi.cyan, qty)}  ${name}  ${paint(output, ansi.dim, size)}  ${paint(output, ansi.green, money)}`);
+  }
+
+  const totalLabel = 'total das estampas'.padEnd(nameWidth);
+  console.log(`  ${paint(output, ansi.bold, '   ')}  ${paint(output, ansi.bold, totalLabel)}  ${' '.repeat(16)}  ${paint(output, ansi.bold + ansi.green, formatReais(total).padStart(10))}`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   generateDTFSheet().catch((err) => {
-    console.error(err);
+    console.error(`${tag(process.stderr, 'erro', ansi.red)} ${err.message || err}`);
     process.exitCode = 1;
   });
 }
